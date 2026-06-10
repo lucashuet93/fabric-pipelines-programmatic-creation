@@ -1,32 +1,57 @@
 # Programmatically Creating Microsoft Fabric Pipelines
 
-A repo for creating and updating Microsoft Fabric data pipelines **programmatically**, without opening the Fabric portal. The sections below cover the file formats Fabric uses to define pipelines and associated activities, how Git integration should be leveraged to "deploy" those files, and the general process for creating or updating a pipeline from code.
+Use the repo as a guide for creating and updating Microsoft Fabric data pipelines from source-controlled files instead of from the Fabric portal canvas.
 
-The repo includes a working pipeline creation agent built on Microsoft Agent Framework + Microsoft Foundry. The agent is one consumer of the process outlined below; the process itself stands on its own.
+The key idea is simple: a Fabric pipeline is a small folder of files. Commit that folder to a Git-integrated Fabric workspace, run **Update from Git**, and Fabric materializes the pipeline. Everything before the sync step is ordinary file generation, review, and Git workflow.
 
-## Fabric Pipeline Artifacts
+The repo also includes a working **Pipeline Creation Agent** built with Microsoft Agent Framework and Azure AI Foundry. The agent puts the process into practice: it gathers requirements conversationally, writes the Fabric artifact files, and can open a pull request with the generated pipeline and notebooks.
 
-In the Fabric portal, a data pipeline looks like a drag-and-drop canvas. Under the hood, it is two files:
+## The General Process
 
-```
+Programmatic pipeline creation has two distinct phases:
+
+1. **Generate Fabric-compatible artifacts in Git.** Create or update the `.DataPipeline` and related `.Notebook` folders, including their `.platform` descriptors and content files.
+2. **Sync Git into Fabric.** Merge the changes into the branch connected to the Fabric workspace, then trigger **Update from Git** manually in the portal or programmatically through the Fabric REST API.
+
+That separation is useful. The artifact-generation phase can be handled by an agent, script, CLI, CI job, template engine, or hand-authored files. Fabric only needs the final Git-tracked folder structure.
+
+A typical lifecycle looks like the following:
+
+1. Decide which Fabric items are needed: pipeline, notebooks, dataflows, lakehouses, and so on.
+2. Create one folder per Fabric item using Fabric's Git integration layout.
+3. Generate stable `logicalId` values for new items and keep existing `logicalId` values unchanged when updating items.
+4. Write the item content files, such as `pipeline-content.json` or `notebook-content.py`.
+5. Commit the folders to the Git-integrated repo, preferably through a pull request.
+6. Merge the PR into the connected branch.
+7. Trigger **Update from Git** so Fabric reads the folders and creates or updates the workspace items.
+
+Only the final sync step talks to Fabric. The rest is normal source control.
+
+## Fabric Artifact Layout
+
+In the Fabric portal, a data pipeline appears as a drag-and-drop canvas. In Git, the same pipeline is represented by a folder:
+
+```text
 <pipeline-name>.DataPipeline/
 ├── .platform
 └── pipeline-content.json
 ```
 
-When you export a pipeline from the portal, Fabric zips the `.DataPipeline` folder. When you import one, Fabric unzips it back into the same two-file structure. The pipeline _is_ the folder.
+The folder is the pipeline. When Fabric exports a pipeline, it exports that folder. When Fabric imports or syncs a pipeline from Git, it reads that folder.
 
-Notebooks follow the identical pattern:
+Notebooks follow the same pattern:
 
-```
+```text
 <notebook-name>.Notebook/
 ├── .platform
 └── notebook-content.py
 ```
 
-### `.platform`, the Fabric item descriptor
+Other Fabric item types use the same general idea: a folder named `<displayName>.<ItemType>` plus a `.platform` descriptor and one or more item-specific content files.
 
-A small JSON file that tells Fabric what kind of item this is and how to identify it:
+### `.platform`
+
+`.platform` is the Fabric item descriptor. It tells Fabric what kind of item the folder represents, what display name to show, and which stable ID identifies the item across syncs.
 
 ```json
 {
@@ -44,13 +69,15 @@ A small JSON file that tells Fabric what kind of item this is and how to identif
 
 Key fields:
 
-- **`metadata.type`**: `DataPipeline`, `Notebook`, `Lakehouse`, etc. Tells Fabric which item kind to materialize.
-- **`metadata.displayName`**: what shows up in the Fabric portal UI.
-- **`config.logicalId`**: a stable GUID that identifies this item across environments. Other items reference it by this ID, not by name. Generate one with `uuid.uuid4()` (or any RFC 4122 UUID generator) when you create a new item, and **never change it** afterwards.
+- `metadata.type`: the Fabric item kind, such as `DataPipeline`, `Notebook`, or `Lakehouse`.
+- `metadata.displayName`: the name shown in the Fabric workspace.
+- `config.logicalId`: the stable identifier for the item. Generate it once for a new item and do not change it afterward.
 
-### `pipeline-content.json`, the pipeline definition
+Cross-item references use `logicalId`, not display name. For example, a pipeline activity that runs a notebook references the notebook's `.platform` `logicalId`.
 
-The actual pipeline graph. It uses the same JSON schema as Azure Data Factory pipelines:
+### `pipeline-content.json`
+
+`pipeline-content.json` defines the pipeline graph. Fabric uses the same general JSON model as Azure Data Factory pipelines: a top-level `properties` object with an `activities` array.
 
 ```json
 {
@@ -77,119 +104,171 @@ The actual pipeline graph. It uses the same JSON schema as Azure Data Factory pi
 }
 ```
 
-Important things to know:
+Important conventions:
 
-- The top-level shape is always `{ "properties": { "activities": [...] } }`.
-- Each activity has a `name`, a `type` (e.g. `TridentNotebook`, `Copy`, `Lookup`, `IfCondition`, `ForEach`, `ExecutePipeline`), a `typeProperties` block specific to that type, an optional `policy`, and a `dependsOn` array that wires up the DAG.
-- **Cross-item references use `logicalId`s, not display names.** When a `TridentNotebook` activity runs `MyNotebook`, its `notebookId` is the `logicalId` from `MyNotebook.Notebook/.platform`.
-- **`workspaceId` in the Git-tracked JSON is always the zero-GUID** (`"00000000-0000-0000-0000-000000000000"`). Fabric resolves it to the actual workspace on **Update from Git**. Using a real workspace GUID here is not portable and causes sync errors across environments.
-- **`dependsOn` orders activities _within the same pipeline_.** Each entry is `{ "activity": "<other activity's name>", "dependencyConditions": ["Succeeded"] }` (or `Failed` / `Skipped` / `Completed`). It is not how a pipeline points at a notebook; that link is `typeProperties.notebookId`.
+- The top-level shape is `{ "properties": { "activities": [...] } }`.
+- Each activity has a `name`, `type`, activity-specific `typeProperties`, optional `policy`, and `dependsOn` array.
+- `dependsOn` orders activities inside the same pipeline. It does not link a pipeline to a notebook.
+- A notebook activity uses `type: "TridentNotebook"` and sets `typeProperties.notebookId` to the notebook item's `logicalId`.
+- In Git-tracked pipeline JSON, `typeProperties.workspaceId` should be the zero GUID: `"00000000-0000-0000-0000-000000000000"`. Fabric resolves the actual workspace during **Update from Git**.
 
-## Git Integration
+## Git Integration Deployment Model
 
-Fabric workspaces can be Git-integrated with an Azure DevOps repo (or GitHub). Once integrated:
+A Fabric workspace can be connected to a Git repository. Once connected, the Git repo becomes the source of truth for supported Fabric items.
 
-1. Each Fabric item maps to one folder in the repo, named `<displayName>.<ItemType>` (e.g. `daily-sales-load.DataPipeline`).
-2. The folder contains the two files described above.
-3. When you press **Update from Git** in the workspace, Fabric reads every `.DataPipeline` / `.Notebook` / etc. folder it finds and materializes (or updates) the corresponding items.
-4. When you press **Commit to Git** from the portal, Fabric writes the current state of each item back out as those same two files.
+The basic deployment model is:
 
-You do not need any Fabric API to create a pipeline. Just add the right folder to the Git repo and hit "Update from Git." 
+1. The repo contains folders such as `daily-sales-load.DataPipeline` and `Load Sales.Notebook`.
+2. A pull request adds or updates those folders.
+3. The pull request is reviewed and merged into the branch connected to Fabric.
+4. Fabric runs **Update from Git**.
+5. Fabric creates or updates the corresponding workspace items.
 
-Fabric exposes API endpoints for both the ["Commit to Git"](https://learn.microsoft.com/en-us/rest/api/fabric/core/git/commit-to-git?tabs=HTTP) and the ["Update from Git"](https://learn.microsoft.com/en-us/rest/api/fabric/core/git/update-from-git?tabs=HTTP) operations so the sync process itself can be triggered programmatically.
+Fabric also exposes REST APIs for the sync operations, so the last step can be automated:
 
-## Pipeline Creation Process
+- [Commit to Git](https://learn.microsoft.com/rest/api/fabric/core/git/commit-to-git?tabs=HTTP) writes portal changes back to Git.
+- [Update from Git](https://learn.microsoft.com/rest/api/fabric/core/git/update-from-git?tabs=HTTP) applies Git changes to the workspace.
 
-To create a new pipeline programmatically:
+You do not need a Fabric pipeline-creation API for the core workflow. You need valid artifact files, a Git-integrated workspace, and an update-from-Git sync.
 
-1. **Pick a folder name** of the form `<displayName>.DataPipeline`. The display name is what the user will see in Fabric.
-2. **Generate a fresh `logicalId`** (any UUID v4 works). Save it; other items that reference this pipeline will need it.
-3. **Write `.platform`** with `type: "DataPipeline"`, your chosen display name, and the new `logicalId`.
-4. **Write `pipeline-content.json`** with the pipeline definition. Start from `{ "properties": { "activities": [] } }` if you want an empty pipeline; otherwise populate `activities` with the JSON shapes Fabric expects.
-5. **Commit and push the folder** to the Git-integrated branch (typically via a PR).
-6. **Trigger "Update from Git"** in the Fabric workspace, either manually in the portal or via the Fabric REST API (`POST /workspaces/{workspaceId}/git/updateFromGit`).
+## Creating A Pipeline By File Generation
 
-Only the last step talks to Fabric at all. Steps 1 through 5 are pure filesystem and Git operations.
+To create a new pipeline without using the Fabric portal canvas:
 
-### Updating an existing pipeline
+1. Choose a display name and create a folder named `<displayName>.DataPipeline`.
+2. Generate a new UUID for `config.logicalId`.
+3. Write `.platform` with `metadata.type: "DataPipeline"`, the display name, and the generated `logicalId`.
+4. Write `pipeline-content.json`. Use an empty activity list for a blank pipeline or populate the `activities` array with Fabric-compatible activity definitions.
+5. Commit and push the folder to the Git-integrated repo.
+6. Trigger **Update from Git** in the Fabric workspace.
 
-Same flow. Edit the existing folder's `pipeline-content.json` (keep the `logicalId` in `.platform` unchanged) and PR the change. Fabric's **Update from Git** diffs the folder and applies the change.
+To update an existing pipeline, edit the existing folder and keep its `.platform` `logicalId` unchanged. Fabric uses that stable ID to understand that the Git folder updates an existing item rather than creating a different one.
 
-### Adding a notebook the pipeline runs
+### Adding A Notebook Dependency
 
-A pipeline that calls a notebook needs the notebook's `logicalId` in its `TridentNotebook` activity. So the order is:
+When a pipeline runs a notebook, create or identify the notebook item first so the pipeline can reference its `logicalId`.
 
-1. Create the notebook folder first (`<notebook-name>.Notebook/`) and generate its `logicalId`.
-2. Reference that `logicalId` in the pipeline's `pipeline-content.json` as `notebookId` (flat under `typeProperties`, not nested in a `notebook` sub-object).
-3. Commit both folders in the **same PR** so Fabric never sees a pipeline pointing at a notebook it does not yet know about.
+Recommended flow:
 
-## Agent Overview
+1. Create `<notebook-name>.Notebook/` with its own `.platform` and `notebook-content.py`.
+2. Copy the notebook's `.platform` `config.logicalId`.
+3. Add a `TridentNotebook` activity to the pipeline with that value as `typeProperties.notebookId`.
+4. Commit the notebook and pipeline folders in the same PR.
+5. Merge and run **Update from Git**.
 
-The Pipeline Creation Agent is one potential surface for programmatic creation of Fabric Pipelines. It exposes Fabric and AzDO specific tools that allow the agent to create the requisite files for a pipeline and open a new PR against a repo. After the PR merges, a Fabric **Update from Git** operation (click or REST call) pulls the new items into the workspace. 
+Keeping related items in the same PR prevents Fabric from seeing a pipeline that references a notebook not yet present in the workspace.
 
-None of these operations are specific to the agent. Any script that performs the same filesystem and Git operations could be used to programmatically create a pipeline.
+## Agent Implementation
 
-### Running the agent
+The included Pipeline Creation Agent is one implementation of the file-generation phase. It does not change the deployment model above; it automates the tedious parts of creating the right folders and JSON.
+
+The agent can:
+
+- Create `pipelines/<name>.DataPipeline/` with `.platform` and `pipeline-content.json`.
+- Create `notebooks/<name>.Notebook/` with `.platform` and `notebook-content.py`.
+- Write pipeline and notebook content as the conversation evolves.
+- Preserve the Fabric conventions for notebook references, zero-GUID workspace IDs, and dependency ordering.
+- Push the generated artifacts to Azure DevOps and open a pull request.
+
+The agent's behavior is defined in [src/instructions.md](src/instructions.md), and the tool implementation lives in [src/agent.py](src/agent.py).
+
+### Agent Workflow
+
+At runtime, the agent follows the same process a script or human would follow:
+
+1. Ask for the pipeline name.
+2. Create the local `.DataPipeline` folder and generate its `logicalId`.
+3. Gather requirements for activities, notebooks, dependencies, and content.
+4. Write complete artifact files to disk after meaningful changes.
+5. Create any notebooks the pipeline needs and use their generated `logicalId` values in `TridentNotebook` activities.
+6. When the user confirms, open a PR containing the pipeline and any related notebooks.
+7. After the PR merges, Fabric **Update from Git** brings the items into the workspace.
+
+In practice, the agent is a conversational front end over the general Git-based artifact workflow.
+
+## Running The Agent
 
 Prerequisites:
 
 - Python 3.10+
-- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) (used for authentication via `AzureCliCredential`)
-- An Azure AI Foundry project with a deployed chat model (e.g. `gpt-4o`)
-- An Azure DevOps repo that is Git-integrated with your Fabric workspace, and a PAT with **Code (Read & Write)** and **Pull Request (Read & Write)** scopes
+- [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli), used by `AzureCliCredential`
+- An Azure AI Foundry project with a deployed chat model
+- An Azure DevOps repo connected to a Fabric workspace through Git integration
+- An Azure DevOps PAT with `Code (Read & Write)` and `Pull Request (Read & Write)` scopes
 
-**1. Create and activate a virtual environment** (from the repo root):
+Create and activate a virtual environment from the repo root:
 
 ```powershell
-# Windows (PowerShell)
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
+On macOS or Linux:
+
 ```bash
-# macOS / Linux
 python -m venv .venv
 source .venv/bin/activate
 ```
 
-**2. Install dependencies:**
+Install dependencies:
 
 ```bash
 pip install -r src/requirements.txt
 ```
 
-**3. Configure environment variables.** Copy the example file and fill in the values:
+Copy the environment template and fill in real values:
 
 ```bash
 cp src/.env.example src/.env
 ```
 
-```
-FOUNDRY_PROJECT_ENDPOINT=https://your-project.services.ai.azure.com/api/projects/<project>
+```text
+FOUNDRY_PROJECT_ENDPOINT=https://your-project.services.ai.azure.com
 FOUNDRY_MODEL=gpt-4o
+FABRIC_WORKSPACE_ID=00000000-0000-0000-0000-000000000000
 AZDO_ORG_URL=https://dev.azure.com/<org>
 AZDO_PROJECT=<project>
 AZDO_REPO=<repo>
 AZDO_DEFAULT_BRANCH=main
-AZDO_PAT=<personal access token>
+AZDO_PAT=<personal-access-token>
 ```
 
-**4. Sign in to Azure** (for the Foundry credential):
+Sign in to Azure for the Foundry credential:
 
 ```bash
 az login
 ```
 
-**5. Run the agent:**
+Run the agent:
 
 ```bash
 python src/agent.py
 ```
 
-Type a request like "Create a pipeline named `daily-sales-load` that runs a notebook called `Load Sales`," let the agent draft the artifacts, then ask it to open a PR. Type `exit` or press `Ctrl+C` to quit.
+Example request:
+
+```text
+Create a pipeline named daily-sales-load that runs a notebook called Load Sales.
+```
+
+The agent writes artifacts under `pipelines/` and `notebooks/`. When you are ready to publish, ask it to open a PR. After the PR merges, run **Update from Git** in the Fabric workspace or call the Fabric REST API.
+
+## Repository Structure
+
+```text
+examples/
+  notebooks/      Example Fabric notebook folder
+  pipelines/      Example Fabric pipeline folder
+notebooks/        Generated notebook artifacts
+pipelines/        Generated pipeline artifacts
+src/
+  agent.py        Agent runtime and tool implementations
+  instructions.md Agent system instructions
+  requirements.txt
+```
 
 ## References
 
 - [Fabric Git integration overview](https://learn.microsoft.com/fabric/cicd/git-integration/intro-to-git-integration)
-- [Fabric data pipeline activity reference](https://learn.microsoft.com/fabric/data-factory/activity-overview) (per-activity `typeProperties` shapes)
-- [Fabric Git integration REST API](https://learn.microsoft.com/rest/api/fabric/core/git), for automating **Update from Git** / **Commit to Git** without the portal
+- [Fabric data pipeline activity reference](https://learn.microsoft.com/fabric/data-factory/activity-overview)
+- [Fabric Git integration REST API](https://learn.microsoft.com/rest/api/fabric/core/git)
