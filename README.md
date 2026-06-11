@@ -4,7 +4,7 @@ Use the repo as a guide for creating and updating Microsoft Fabric data pipeline
 
 The key idea is simple: a Fabric pipeline is a small folder of files. Commit that folder to a Git-integrated Fabric workspace, run **Update from Git**, and Fabric materializes the pipeline. Everything before the sync step is ordinary file generation, review, and Git workflow.
 
-The repo also includes a working **Pipeline Creation Agent** built with Microsoft Agent Framework and Azure AI Foundry. The agent puts the process into practice: it gathers requirements conversationally, writes the Fabric artifact files, and can open a pull request with the generated pipeline and notebooks.
+The repo also includes a working **Pipeline Creation Agent** built with Microsoft Agent Framework and Microsoft Foundry. The agent puts the process into practice: it gathers requirements conversationally, writes the Fabric artifact files, and can open a pull request with the generated pipeline and notebooks.
 
 ## The General Process
 
@@ -192,7 +192,7 @@ Prerequisites:
 
 - Python 3.10+
 - [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli), used by `AzureCliCredential`
-- An Azure AI Foundry project with a deployed chat model
+- An Microsoft Foundry project with a deployed chat model
 - An Azure DevOps repo connected to a Fabric workspace through Git integration
 - An Azure DevOps PAT with `Code (Read & Write)` and `Pull Request (Read & Write)` scopes
 
